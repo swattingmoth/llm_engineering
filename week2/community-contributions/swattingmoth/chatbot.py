@@ -1,21 +1,18 @@
-from ast import Mod
+from PIL import Image
 import base64
-from calendar import c
 from contextlib import contextmanager
 import inspect
-from json import tool
-from operator import call
 import os
 import json
 import re
-from typing import Any, Callable, Generator
+from typing import Any, Callable, Generator, Optional
 import uuid
 from attr import dataclass
 from dotenv import load_dotenv
-from numpy import full
 from openai import OpenAI, omit
 import gradio as gr
 from datetime import datetime
+import io
 
 def today_date():
     """Tool function to return today's date"""
@@ -24,8 +21,31 @@ def today_date():
 @dataclass
 class ToolResult:
     content_for_model: str
-    content_type:str = "text"
     content:Any
+    content_type:str = "text"
+
+    def __str__(self) -> str:
+        # Convert content to string and slice first 100 characters
+        content_str = str(self.content)
+        truncated = content_str[:100] + "..." if len(content_str) > 100 else content_str
+        
+        return (
+            f"ToolResult:\n"
+            f"  Model Content: {self.content_for_model}\n"
+            f"  Type: {self.content_type}\n"
+            f"  Content Preview: {truncated}"
+        )
+
+    def __repr__(self) -> str:
+        # Convert content to string, slice first 100 characters, and keep it safe for a single line
+        content_str = str(self.content)
+        truncated = content_str[:100] + "..." if len(content_str) > 100 else content_str
+        
+        return (
+            f"ToolResult(content_for_model={self.content_for_model!r}, "
+            f"content_type={self.content_type!r}, "
+            f"content_preview={truncated!r})"
+        )
 
 class Models:
     IMAGES = "grok-imagine-image"
@@ -33,12 +53,13 @@ class Models:
     COMPLEX_QUESTIONS = "grok-4.3"
 
 class ModelContext:
-    _instance:"ModelContext" = None
+    _instance:Optional["ModelContext"] = None
 
     def __init__(self, client:OpenAI, image_path:str):
         self.model_name = Models.QUESTIONS
         self._client = client
         self._image_path = image_path
+        self._tools = Tools()
 
     @classmethod
     def create(cls, client:OpenAI, image_path:str):
@@ -73,6 +94,25 @@ class ModelContext:
     @property
     def image_path(self)->str:
         return self._image_path
+    
+    @property
+    def tools(self)->"Tools":
+        return self._tools
+    
+    def register_tool(self, func:Callable, description:str):
+        """Registers a function as a tool for the LLM to use."""
+        self._tools.register_tool(func, description)
+
+    def remove_tool(self, func:Callable):
+        """Removes a tool from the registry."""
+        self._tools.remove_tool(func)
+
+    def handle_tool_calls(self, message)->tuple[list[dict[str, Any]], list[ToolResult|None]]:
+        """Handles tool calls from the model by executing the corresponding functions and returning their results."""
+        return self._tools.handle_tool_calls(message)
+    
+    def get_tools_for_model(self) -> list[dict[str, Any]]:
+        return self._tools.get_tools_for_model()
     
     @contextmanager
     def use_model(self, model_name:str):
@@ -139,7 +179,7 @@ class Tools:
                 result_for_model = result
                 if isinstance(result, ToolResult):
                     result_for_model = result.content_for_model
-                    tool_results.append(result.content)
+                    tool_results.append(result)
                 else:
                     tool_results.append(None)
 
@@ -150,7 +190,7 @@ class Tools:
                 })
         return responses, tool_results
 
-    def get_tools_for_model(self):
+    def get_tools_for_model(self) -> list[dict[str, Any]]:
         return [{"type": "function", "function": self.tools[t]["json"]} for t in self.tools]    
 
 def init_api(api_key_name:str, api_url:str)->OpenAI:
@@ -182,10 +222,10 @@ def get_description(docstring, param_name):
 class ChatInterface:
     SYSTEM_MESSAGE = "You are a helpful assistant. Only answer factually, and if you do not know the answer don't make anything up."
     
-    def __init__(self, client: OpenAI, tools: Tools):
-        self.client = client
-        self.tools = tools
+    def __init__(self, modelContext:ModelContext):
         self.chat_history: list[dict[str, str]] = []
+        self.modelContext = modelContext
+        self.image:Optional[Image.Image] = None
         
     def _get_model_for_choice(self, choice: str) -> str:
         """Map dropdown choice to appropriate model."""
@@ -201,7 +241,7 @@ class ChatInterface:
         """Get system message based on choice."""
         if choice == "Generate Image":
             return """"You are an assistant that helps generate images based on user requests.
-             The user will provide a description of the image they want and you will help them refine that description if needed, and then call the image generation tool with the final prompt.
+             The user will provide a description of the image they want and you will help them refine that description if needed, and then call the image generation tool with the final prompt. Call the image generation tool at most once per prompt. Always follow the content guidelines for image generation:
              The user must not ask for an image that contains nudity, suggestive content, or graphic violence. However, acts of affection (e.g. hugging, kissing) and display of weapons (e.g swords, guns, knives) are acceptable.
              If the user requests an image that violates the content guidelines, let the user know tht you cannot generate the image because it violates the content guidelines and what part of their request violates the guidelines.
                 Always follow the guidelines and never generate content that violates them.
@@ -212,6 +252,7 @@ class ChatInterface:
                 Assistant: Can you provide more details about the dog picture you want? For example, what breed of dog, what setting or background, any specific colors or actions you want the dog to be doing?
 
                 User: I would like a picture of a man with dark hair and skin wearing armor and holding a sword in an outstreached hand. The man is standing on a desolate battlefield with smoke in the background.
+                Tool Call: Generated Image
                 Assistant: Here is the image based on your request.
 
                 User: I want a picture of a man with his head cut off.
@@ -221,6 +262,7 @@ class ChatInterface:
                 Assistant: I'm sorry, but I cannot generate that image because it violates the content guidelines regarding suggestive content. Specifically, the request for a pictures of people in bikinis is not something I can assist with. Please let me know if you have another image request that follows the guidelines.
              """
         return self.SYSTEM_MESSAGE
+    
     def _collect_stream(self, stream):
         """Collect all chunks from a stream, yielding text content and accumulating tool calls."""
         full_content = ""
@@ -236,19 +278,18 @@ class ChatInterface:
             
             # Collect tool calls (they come in parts across chunks)
             if delta.tool_calls:
-                tool_responses, tool_results = self.tools.handle_tool_calls(delta)
+                tool_responses, tool_results = self.modelContext.handle_tool_calls(delta)
                 yield ("tool_call", tool_responses)
                 yield ("tool_result", tool_results)
     
     def chat(self, message: str, chat_history: list[dict[str, str]], choice: str)->Generator[Any, Any, Any]:
         """Stream chat responses token by token with proper tool handling."""
         if not message:
-            return chat_history, None
+            return chat_history, self.image
         
         # Add user message to history
         self.chat_history.append({"role": "user", "content": message})
         local_chat_history = [c for c in self.chat_history]  # Create a local copy for this interaction
-        chat_history.append([message, ""])
         
         model = self._get_model_for_choice(choice)
         is_image_mode = choice == "Generate Image"
@@ -257,29 +298,30 @@ class ChatInterface:
             # Process in a loop to handle tool calls and follow-ups
             while True:
                 # Build messages with system context
-                messages = [{"role": "system", "content": self.SYSTEM_MESSAGE}]
+                messages = [{"role": "system", "content": self._get_system_message_for_choice(choice)}]
                 messages.extend(self.chat_history)
                 
                 # Create streaming response
-                stream = self.client.chat.completions.create(
+                stream = self.modelContext.client.chat.completions.create(
                     model=model,
-                    messages=messages,
-                    tools=self.tools.get_tools_for_model() if self.tools.tools else omit,
+                    messages=messages, # type:ignore[arg-type]
+                    tools=self.modelContext.get_tools_for_model() if self.modelContext.tools else omit, #type:ignore[arg-type]
                     stream=True,
                 )
                 
                 # Collect and stream all chunks
                 full_response = ""    
                 tool_calls = []        
-                for item_type, item_data in self._collect_stream(stream):
+                for item_type, tool_results in self._collect_stream(stream):
                     if item_type == "text":
-                        full_response += item_data
-                        yield local_chat_history + [{"role": "assistant", "content": full_response or ""}], None
+                        full_response += tool_results
+                        yield local_chat_history + [{"role": "assistant", "content": full_response or ""}], self.image
                     elif item_type == "tool_call":
-                        tool_calls.extend(item_data)
+                        tool_calls.extend(tool_results)
                     elif item_type == "tool_result" and is_image_mode:
-                        for image_data in [i for i in item_data if i and i.content_type == "image"]:
-                            yield local_chat_history + [{"role": "assistant", "content": full_response or ""}], image_data
+                        for image_data in [i.content for i in tool_results if i and i.content_type == "image"]:
+                            self.image = Image.open(io.BytesIO(image_data))
+                            yield local_chat_history + [{"role": "assistant", "content": full_response or ""}], self.image
                 
                 # Add assistant response to history
                 if full_response:
@@ -294,9 +336,8 @@ class ChatInterface:
             print(f"Error in chat: {e}")
             # Show generic error without details
             error_msg = "I encountered an error processing your request. Please try again."
-            chat_history[-1][1] = error_msg
             self.chat_history.append({"role": "assistant", "content": error_msg})
-            yield self.chat_history, None
+            yield self.chat_history, self.image
     
     def _extract_image_from_response(self, response: str):
         """Extract image data from response (URL, file path, or base64)."""
@@ -323,9 +364,9 @@ class ChatInterface:
         return []
 
 
-def launch_app(client: OpenAI, tools: Tools):
+def launch_app():
     """Launch the Gradio Blocks interface."""
-    chat_interface = ChatInterface(client, tools)
+    chat_interface = ChatInterface(ModelContext.current())
     
     with gr.Blocks(title="AI Assistant") as demo:
         gr.Markdown("# AI Assistant")
@@ -347,7 +388,7 @@ def launch_app(client: OpenAI, tools: Tools):
         image_output = gr.Image(
             label="Generated Image",
             visible=False,
-            type="filepath"
+            type="pil"
         )
         
         with gr.Row():
@@ -362,6 +403,11 @@ def launch_app(client: OpenAI, tools: Tools):
         
         def on_choice_change(selected_choice):
             """Update image visibility based on choice."""
+            if selected_choice == "Generate Image":
+                ModelContext.current().register_tool(generate_image_tool, "Generate an image based on a text prompt")
+            else:
+                ModelContext.current().remove_tool(generate_image_tool)
+
             return gr.update(visible=(selected_choice == "Generate Image"))
         
         choice.change(
@@ -406,7 +452,7 @@ def launch_app(client: OpenAI, tools: Tools):
 
 def generate_image(prompt:str, model:str, client:OpenAI, image_path:str)->tuple[str, bytes]:
     """Example function to generate an image using the API."""
-    image_system_prompt = "Generate an image basedo on the request below. The generaged image must not include any nudity, suggestive content, or graphic violence. If requested, acts of affection (e.g. hugging, kissing) and display of weapons (e.g swords, guns, knives) is acceptable. If the requested picture does not meet the guidelines generate a picture of a peaceful landscape instead. Always follow the guidelines and never generate content that violates them.\n\nRequest:"
+    image_system_prompt = "Generate an image based on the request below. The generaged image must not include any nudity, suggestive content, or graphic violence. If requested, acts of affection (e.g. hugging, kissing) and display of weapons (e.g swords, guns, knives) is acceptable. If the requested picture does not meet the guidelines generate a picture of a peaceful landscape instead. Always follow the guidelines and never generate content that violates them.\n\nRequest:"
     image_response = client.images.generate(
             model=model,
             prompt=f"{image_system_prompt}\n\n{prompt}",
@@ -414,8 +460,8 @@ def generate_image(prompt:str, model:str, client:OpenAI, image_path:str)->tuple[
             n=1,
             response_format="b64_json",
         )
-    image_base64 = image_response.data[0].b64_json
-    image_data = base64.b64decode(image_base64)
+    image_base64 = image_response.data[0].b64_json # type: ignore[index]
+    image_data = base64.b64decode(image_base64) # type:ignore[arg-type]
     image_file = os.path.join(image_path, f"{uuid.uuid4()}.png")
     with open(image_file, "wb") as f:
         f.write(image_data)
@@ -429,20 +475,15 @@ def generate_image_tool(prompt:str)->ToolResult:
     model_context = ModelContext.current()
     with model_context.use_model(Models.IMAGES):
         _, image_data = generate_image(prompt, model_context.model_name, model_context.client, model_context.image_path)
-    return ToolResult(content_for_model="Generated an image.", content=image_data)
+    return ToolResult(content_for_model="Generated an image.", content=image_data, content_type="image")
 
-# Example usage (uncomment to run)
+
 if __name__ == "__main__":
     load_dotenv()
     xai_api_key = os.getenv('XAI_API_KEY')
     client = init_api("XAI_API_KEY", "https://api.x.ai/v1")
     ModelContext.create(client, r"C:\Users\jordan-dev\model_output\images")
-    # tools = Tools()
-    # tools.register_tool(today_date, "Get today's date in YYYY-MM-DD format")
-    # app = launch_app(client, tools)
-    # app.launch()
-
-    generate_image("A picture of a 4 year old girl in a pink dress running through a field of long grass while laughing. She has curly, brown hair, and her skin is tan from being in the sun. She is holding a flower in one hand.",
-                   Models.IMAGES, client, r"C:\Users\jordan-dev\model_output\images")
-
+    ModelContext.current().register_tool(today_date, "Get today's date in YYYY-MM-DD format")
+    app = launch_app()
+    app.launch()
 
