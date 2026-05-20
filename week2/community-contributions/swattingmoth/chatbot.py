@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from openai import OpenAI, omit
 import gradio as gr
 from datetime import datetime
+from types import SimpleNamespace
 import io
 
 def today_date():
@@ -171,23 +172,34 @@ class Tools:
             print(f"Got tool call {tool_call}")
             func = self.tools.get(tool_call.function.name, {})
             if func:
-                arguments = json.loads(tool_call.function.arguments)
-                print(f"Calling function {func['function']} with arguments {arguments}")
-                result = func['function'](**arguments)
-                print(f"Got result {result} from tool call")
-                
-                result_for_model = result
-                if isinstance(result, ToolResult):
-                    result_for_model = result.content_for_model
-                    tool_results.append(result)
-                else:
-                    tool_results.append(None)
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                    print(f"Calling function {func['function']} with arguments {arguments}")
+                    result = func['function'](**arguments)
+                    print(f"Got result {result} from tool call")
+                    
+                    result_for_model = result
+                    if isinstance(result, ToolResult):
+                        result_for_model = result.content_for_model
+                        tool_results.append(result)
+                    else:
+                        tool_results.append(None)
 
-                responses.append({
-                    "role": "tool",
-                    "content": result_for_model or "",
-                    "tool_call_id": tool_call.id
-                })
+                    responses.append({
+                        "role": "tool",
+                        "content": result_for_model or "",
+                        "tool_call_id": tool_call.id
+                    })
+                except Exception as e:
+                    print(f"Error executing tool {tool_call.function.name}: {e}")
+                    arguments = {}
+                    responses.append({
+                        "role": "tool",
+                        "content": f"Error executing tool {tool_call.function.name}",
+                        "tool_call_id": tool_call.id
+                    })
+
+                
         return responses, tool_results
 
     def get_tools_for_model(self) -> list[dict[str, Any]]:
@@ -240,45 +252,77 @@ class ChatInterface:
     def _get_system_message_for_choice(self, choice:str)->str:
         """Get system message based on choice."""
         if choice == "Generate Image":
-            return """"You are an assistant that helps generate images based on user requests.
-             The user will provide a description of the image they want and you will help them refine that description if needed, and then call the image generation tool with the final prompt. Call the image generation tool at most once per prompt. Always follow the content guidelines for image generation:
-             The user must not ask for an image that contains nudity, suggestive content, or graphic violence. However, acts of affection (e.g. hugging, kissing) and display of weapons (e.g swords, guns, knives) are acceptable.
-             If the user requests an image that violates the content guidelines, let the user know tht you cannot generate the image because it violates the content guidelines and what part of their request violates the guidelines.
-                Always follow the guidelines and never generate content that violates them.
-             If the use asks for an image, but does not provide enough details, tell the user thay they need to supply additional details and give suggestion a suggestion based on the user's prompt that contains additional details.
+            return """You are an assistant that helps generate images based on user requests.
+             The user will provide a description of the image they want and you will help them refine that description if needed, and then call the image generation tool with the final prompt.
+             Call the image generation tool at most once per user request. If the request violates the content guidelines, do not call the tool at all; instead refuse the request and explain which part violates the guidelines.
+             Do not issue multiple image generation tool calls for the same request.
+             Always follow the content guidelines for image generation: the user must not ask for an image that contains nudity, suggestive content, or graphic violence. However, acts of affection (e.g. hugging, kissing), display of weapons (e.g. swords, guns, knives), preparation for warfare (e.g. building fortifications, assembling troops) are acceptable.
+             If the user asks for an image but does not provide enough details, ask them for more information and suggest additional details.
+             Only tell the user that you are calling the image generation tool when you are actually making a tool call. If the prompt that you pass to the tool is different from the user's original prompt, include the final prompt in your message to the user.
 
              Examples:
                 User: I want a picture of a dog.
                 Assistant: Can you provide more details about the dog picture you want? For example, what breed of dog, what setting or background, any specific colors or actions you want the dog to be doing?
 
-                User: I would like a picture of a man with dark hair and skin wearing armor and holding a sword in an outstreached hand. The man is standing on a desolate battlefield with smoke in the background.
+                User: I would like a picture of a man with dark hair and skin wearing armor and holding a sword in an outstretched hand. The man is standing on a desolate battlefield with smoke in the background.
+                Assistant: Calling the image generation tool.
                 Tool Call: Generated Image
-                Assistant: Here is the image based on your request.
 
                 User: I want a picture of a man with his head cut off.
                 Assistant: I'm sorry, but I cannot generate that image because it violates the content guidelines regarding graphic violence. Specifically, the request for a picture of a man with his head cut off is not something I can assist with. Please let me know if you have another image request that follows the guidelines.
 
                 User: I want a picture of a woman in a bikini.
-                Assistant: I'm sorry, but I cannot generate that image because it violates the content guidelines regarding suggestive content. Specifically, the request for a pictures of people in bikinis is not something I can assist with. Please let me know if you have another image request that follows the guidelines.
+                Assistant: I'm sorry, but I cannot generate that image because it violates the content guidelines regarding suggestive content. Specifically, the request for a picture of a woman in a bikini is not something I can assist with. Please let me know if you have another image request that follows the guidelines.
              """
         return self.SYSTEM_MESSAGE
     
     def _collect_stream(self, stream):
         """Collect all chunks from a stream, yielding text content and accumulating tool calls."""
         full_content = ""
-        
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+
         for chunk in stream:
-            delta = chunk.choices[0].delta
-            
-            # Collect text content
+            choice = chunk.choices[0]
+            delta = choice.delta
+
             if delta.content:
                 token = delta.content
                 full_content += token
                 yield ("text", token)
-            
-            # Collect tool calls (they come in parts across chunks)
+
             if delta.tool_calls:
-                tool_responses, tool_results = self.modelContext.handle_tool_calls(delta)
+                for tc in delta.tool_calls:
+                    idx = getattr(tc, "index", 0) or 0
+                    if idx not in tool_calls_by_index:
+                        tool_calls_by_index[idx] = {
+                            "id": "",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    acc = tool_calls_by_index[idx]
+                    if getattr(tc, "id", None) is not None:
+                        acc["id"] = tc.id
+                    if getattr(tc, "function", None) is not None:
+                        if getattr(tc.function, "name", None) is not None:
+                            acc["function"]["name"] = tc.function.name
+                        if getattr(tc.function, "arguments", None) is not None:
+                            acc["function"]["arguments"] += tc.function.arguments or ""
+
+            if getattr(choice, "finish_reason", None) == "tool_calls" and tool_calls_by_index:
+                tool_message = SimpleNamespace(tool_calls=[])
+                for tool_call_info in tool_calls_by_index.values():
+                    function = SimpleNamespace(
+                        name=tool_call_info["function"]["name"],
+                        arguments=tool_call_info["function"]["arguments"],
+                    )
+                    tool_message.tool_calls.append(
+                        SimpleNamespace(
+                            id=tool_call_info["id"],
+                            function=function,
+                        )
+                    )
+                tool_calls_by_index.clear()
+
+                tool_responses, tool_results = self.modelContext.handle_tool_calls(tool_message)
                 yield ("tool_call", tool_responses)
                 yield ("tool_result", tool_results)
     
@@ -290,9 +334,11 @@ class ChatInterface:
         # Add user message to history
         self.chat_history.append({"role": "user", "content": message})
         local_chat_history = [c for c in self.chat_history]  # Create a local copy for this interaction
+        yield local_chat_history + [{"role": "assistant", "content": "",  "metadata": {"title": "Thinking...", "status": "pending"}}], self.image  # Yield initial state with user message added
         
         model = self._get_model_for_choice(choice)
         is_image_mode = choice == "Generate Image"
+
         
         try:
             # Process in a loop to handle tool calls and follow-ups
@@ -302,10 +348,11 @@ class ChatInterface:
                 messages.extend(self.chat_history)
                 
                 # Create streaming response
+                # prevent the model from calling the image generation tool multiple times for a single response.
                 stream = self.modelContext.client.chat.completions.create(
                     model=model,
                     messages=messages, # type:ignore[arg-type]
-                    tools=self.modelContext.get_tools_for_model() if self.modelContext.tools else omit, #type:ignore[arg-type]
+                    tools=self.modelContext.get_tools_for_model(), #type:ignore[arg-type]
                     stream=True,
                 )
                 
@@ -325,11 +372,20 @@ class ChatInterface:
                 
                 # Add assistant response to history
                 if full_response:
-                    self.chat_history.append({"role": "assistant", "content": full_response or ""})
+                    history_entry = {"role": "assistant", "content": full_response or ""}
+                    self.chat_history.append(history_entry)
+                    local_chat_history.append(history_entry)
                 if tool_calls:
                     self.chat_history.extend(tool_calls)
+                    local_chat_history.extend(tool_calls)
+                    if is_image_mode and self.image:
+                        # make sure no additonal images are generated for the same prompt.
+                        self._print_chat()
+                        break
+                    
                     continue
                 
+                self._print_chat()
                 break
                 
         except Exception as e:
@@ -338,6 +394,12 @@ class ChatInterface:
             error_msg = "I encountered an error processing your request. Please try again."
             self.chat_history.append({"role": "assistant", "content": error_msg})
             yield self.chat_history, self.image
+
+    def _print_chat(self):
+        print("*********** Finished a chat iteration ***********")
+        for entry in self.chat_history:
+            print(entry)
+        print("**********************************************")
     
     def _extract_image_from_response(self, response: str):
         """Extract image data from response (URL, file path, or base64)."""
@@ -361,6 +423,7 @@ class ChatInterface:
     def clear_history(self):
         """Clear chat history."""
         self.chat_history = []
+        self.image = None
         return []
 
 
@@ -475,6 +538,9 @@ def generate_image_tool(prompt:str)->ToolResult:
     model_context = ModelContext.current()
     with model_context.use_model(Models.IMAGES):
         _, image_data = generate_image(prompt, model_context.model_name, model_context.client, model_context.image_path)
+    # with open(r"C:\Users\jordan-dev\model_output\images\5e6305fa-e54d-496b-b742-6f49ba5f1e45.png", "rb") as f:
+    #     image_data = f.read()
+
     return ToolResult(content_for_model="Generated an image.", content=image_data, content_type="image")
 
 
