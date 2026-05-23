@@ -1,3 +1,8 @@
+"""A chabot interface the supports question answering and tool calls with streaming. It also supports image generation as a tool call. 
+This assumes use of the XAI API, but can be modified to work with other APIs. 
+
+All generated images are written to disk. The default path is c:\temp, but can be changed by modifying the call to ModelContext.create in the __main__ block.
+"""
 from PIL import Image
 import base64
 from contextlib import contextmanager
@@ -5,11 +10,12 @@ import inspect
 import os
 import json
 import re
-from typing import Any, Callable, Generator, Optional
+from typing import Any, Callable, Generator, Optional, cast
 import uuid
 from attr import dataclass
 from dotenv import load_dotenv
-from openai import OpenAI, omit
+from openai import OpenAI, Stream, omit
+from openai.types.chat import ChatCompletionChunk
 import gradio as gr
 from datetime import datetime
 from types import SimpleNamespace
@@ -64,12 +70,29 @@ class ModelContext:
 
     @classmethod
     def create(cls, client:OpenAI, image_path:str):
+        """Initialize or return the singleton ModelContext instance.
+
+        Args:
+            client (OpenAI): The OpenAI client instance used for API calls.
+            image_path (str): Directory path where generated images will be saved.
+
+        Returns:
+            ModelContext: The singleton ModelContext instance.
+        """
         if cls._instance is None:
             cls._instance = cls(client, image_path)
         return cls._instance
     
     @classmethod
     def current(cls):
+        """Return the currently initialized ModelContext instance.
+
+        Raises:
+            Exception: If the ModelContext has not been initialized.
+
+        Returns:
+            ModelContext: The current ModelContext instance.
+        """
         if cls._instance:
             return cls._instance
         
@@ -77,10 +100,12 @@ class ModelContext:
 
     @property
     def model_name(self)->str:
+        """Get the name of the current model in use."""
         return self._model_name
 
     @model_name.setter
     def model_name(self, value:str):
+        """Set the current model name."""
         self._validate_model(value)
         self._model_name = value
     
@@ -90,34 +115,38 @@ class ModelContext:
         
     @property
     def client(self)->OpenAI:
+        """Get the OpenAI client used by this context."""
         return self._client
     
     @property
     def image_path(self)->str:
+        """Get the directory path where generated images are stored."""
         return self._image_path
     
     @property
     def tools(self)->"Tools":
+        """Get the registered tool manager."""
         return self._tools
     
     def register_tool(self, func:Callable, description:str):
-        """Registers a function as a tool for the LLM to use."""
+        """Register a callable as a tool for the LLM to use."""
         self._tools.register_tool(func, description)
 
     def remove_tool(self, func:Callable):
-        """Removes a tool from the registry."""
+        """Remove a registered tool from the tool registry."""
         self._tools.remove_tool(func)
 
     def handle_tool_calls(self, message)->tuple[list[dict[str, Any]], list[ToolResult|None]]:
-        """Handles tool calls from the model by executing the corresponding functions and returning their results."""
+        """Execute tool calls requested by the model and return their responses."""
         return self._tools.handle_tool_calls(message)
     
     def get_tools_for_model(self) -> list[dict[str, Any]]:
+        """Return the tool metadata formatted for model use."""
         return self._tools.get_tools_for_model()
     
     @contextmanager
     def use_model(self, model_name:str):
-        """Context manager to temporarily switch models."""
+        """Temporarily switch the current model within a context block."""
         self._validate_model(model_name)
         old_model = self.model_name
         self.model_name = model_name
@@ -128,12 +157,14 @@ class ModelContext:
 
 class Tools:
     def __init__(self):
+        """Initialize the tool registry."""
         self.tools = {}
 
     def register_tool(self, func:Callable, description:str):
-        """Registers a function as a tool for the LLM to use.
+        """Register a function as a tool that the model can call.
 
-        Parameter types are derived from function annotations, and descriptions are derived from the function docstrings
+        Parameter types are derived from function annotations, and descriptions are derived from the function docstrings.
+
         Args:
             func (Callable): The function to register as a tool.
             description (str): A brief description of what the tool does.
@@ -203,16 +234,26 @@ class Tools:
         return responses, tool_results
 
     def get_tools_for_model(self) -> list[dict[str, Any]]:
+        """Return the tool metadata formatted for the model's tool interface."""
         return [{"type": "function", "function": self.tools[t]["json"]} for t in self.tools]    
 
 def init_api(api_key_name:str, api_url:str)->OpenAI:
+    """Initialize the OpenAI client using environment configuration.
+
+    Args:
+        api_key_name (str): Environment variable name for the API key.
+        api_url (str): Base URL for the OpenAI-compatible API.
+
+    Returns:
+        OpenAI: Configured OpenAI client instance.
+    """
     load_dotenv()
     api_key = os.getenv(api_key_name)
     return OpenAI(api_key=api_key, base_url=api_url)
 
 
 def get_property_type(annotation, for_xai: bool):
-    """Helper function for Tools class to get property types."""
+    """Return the JSON property type name for a function annotation."""
     if for_xai:
         if annotation == str or annotation == inspect.Parameter.empty:
             return "string"
@@ -220,7 +261,15 @@ def get_property_type(annotation, for_xai: bool):
 
 
 def get_description(docstring, param_name):
-    """A naive way to extract parameter descriptions from a docstring."""
+    """Extract a parameter description from a function docstring.
+
+    Args:
+        docstring (str): The function docstring to parse.
+        param_name (str): The parameter name to locate.
+
+    Returns:
+        str: The description text for the parameter, or an empty string if none found.
+    """
     if not docstring:
         return ""
     lines = docstring.splitlines()
@@ -235,6 +284,11 @@ class ChatInterface:
     SYSTEM_MESSAGE = "You are a helpful assistant. Only answer factually, and if you do not know the answer don't make anything up."
     
     def __init__(self, modelContext:ModelContext):
+        """Create a chat interface that streams responses and manages tool usage.
+
+        Args:
+            modelContext (ModelContext): The shared model context used for API calls and tools.
+        """
         self.chat_history: list[dict[str, str]] = []
         self.modelContext = modelContext
         self.image:Optional[Image.Image] = None
@@ -276,7 +330,7 @@ class ChatInterface:
              """
         return self.SYSTEM_MESSAGE
     
-    def _collect_stream(self, stream):
+    def _collect_stream(self, stream:Stream[ChatCompletionChunk])->Generator[tuple[str, Any], None, None]:
         """Collect all chunks from a stream, yielding text content and accumulating tool calls."""
         full_content = ""
         tool_calls_by_index: dict[int, dict[str, Any]] = {}
@@ -303,9 +357,9 @@ class ChatInterface:
                         acc["id"] = tc.id
                     if getattr(tc, "function", None) is not None:
                         if getattr(tc.function, "name", None) is not None:
-                            acc["function"]["name"] = tc.function.name
+                            acc["function"]["name"] = tc.function.name #type: ignore[union-attr]
                         if getattr(tc.function, "arguments", None) is not None:
-                            acc["function"]["arguments"] += tc.function.arguments or ""
+                            acc["function"]["arguments"] += tc.function.arguments or "" #type: ignore[union-attr]
 
             if getattr(choice, "finish_reason", None) == "tool_calls" and tool_calls_by_index:
                 tool_message = SimpleNamespace(tool_calls=[])
@@ -327,7 +381,16 @@ class ChatInterface:
                 yield ("tool_result", tool_results)
     
     def chat(self, message: str, chat_history: list[dict[str, str]], choice: str)->Generator[Any, Any, Any]:
-        """Stream chat responses token by token with proper tool handling."""
+        """Stream chat responses token by token and handle tool calls.
+
+        Args:
+            message (str): The user's input message.
+            chat_history (list[dict[str, str]]): Current chat history from the UI.
+            choice (str): Selected chat mode, such as question or image generation.
+
+        Yields:
+            tuple: Intermediate chat history and optional image data while streaming.
+        """
         if not message:
             return chat_history, self.image
         
@@ -359,7 +422,7 @@ class ChatInterface:
                 # Collect and stream all chunks
                 full_response = ""    
                 tool_calls = []        
-                for item_type, tool_results in self._collect_stream(stream):
+                for item_type, tool_results in self._collect_stream(cast(Stream[ChatCompletionChunk], stream)):
                     if item_type == "text":
                         full_response += tool_results
                         yield local_chat_history + [{"role": "assistant", "content": full_response or ""}], self.image
@@ -401,27 +464,8 @@ class ChatInterface:
             print(entry)
         print("**********************************************")
     
-    def _extract_image_from_response(self, response: str):
-        """Extract image data from response (URL, file path, or base64)."""
-        # Simple extraction - look for common URL patterns or file paths
-        
-        # Look for URLs
-        url_pattern = r'https?://[^\s]+'
-        urls = re.findall(url_pattern, response)
-        if urls:
-            return urls[0]
-        
-        # Look for file paths
-        path_pattern = r'[/\\][\w/\\.-]*\.(?:png|jpg|jpeg|gif|webp)'
-        paths = re.findall(path_pattern, response)
-        if paths:
-            return paths[0]
-        
-        # Return None if no image found
-        return None
-    
     def clear_history(self):
-        """Clear chat history."""
+        """Clear stored chat history and reset the image output."""
         self.chat_history = []
         self.image = None
         return []
@@ -538,6 +582,7 @@ def generate_image_tool(prompt:str)->ToolResult:
     model_context = ModelContext.current()
     with model_context.use_model(Models.IMAGES):
         _, image_data = generate_image(prompt, model_context.model_name, model_context.client, model_context.image_path)
+    # uncomment below to test with a static image instead of generating a new one each time.
     # with open(r"C:\Users\jordan-dev\model_output\images\5e6305fa-e54d-496b-b742-6f49ba5f1e45.png", "rb") as f:
     #     image_data = f.read()
 
@@ -548,7 +593,7 @@ if __name__ == "__main__":
     load_dotenv()
     xai_api_key = os.getenv('XAI_API_KEY')
     client = init_api("XAI_API_KEY", "https://api.x.ai/v1")
-    ModelContext.create(client, r"C:\Users\jordan-dev\model_output\images")
+    ModelContext.create(client, r"C:\temp")
     ModelContext.current().register_tool(today_date, "Get today's date in YYYY-MM-DD format")
     app = launch_app()
     app.launch()
